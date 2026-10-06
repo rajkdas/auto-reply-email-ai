@@ -7,7 +7,7 @@ Two tables:
                   even after a crash mid-send.
 - ``replies_sent`` - lightweight per-sender daily counter for the cap.
 """
-
+"""
 from __future__ import annotations
 
 import logging
@@ -188,5 +188,32 @@ class Store:
                 rows.append(dict(r))
         return rows
 
+
+__all__ = ["Store"]
+"""
+
+# TEMPORARY DEMO STORE (No SQLite)
+import logging
+
+# Store message IDs and sender counts in memory
+_processed_emails = set()
+_sender_counts = {}
+
+async def init_db(db_path: str):
+    logging.info("Demo mode: Using in-memory store instead of SQLite.")
+    pass
+
+async def is_processed(message_id: str) -> bool:
+    return message_id in _processed_emails
+
+async def mark_sending(message_id: str, outcome: str, analysis: dict, reply: dict):
+    _processed_emails.add(message_id)
+
+async def mark_sent(message_id: str, sender: str):
+    # Increment the daily count for this sender
+    _sender_counts[sender] = _sender_counts.get(sender, 0) + 1
+
+async def get_replies_today(sender: str) -> int:
+    return _sender_counts.get(sender, 0)
 
 __all__ = ["Store"]
