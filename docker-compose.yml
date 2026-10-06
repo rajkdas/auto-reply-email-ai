@@ -1,0 +1,18 @@
+services:
+  replydesk:
+    build: .
+    image: replydesk:latest
+    container_name: replydesk
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persistent SQLite DB + logs.
+      - ./data:/data
+      # Your products.yaml (catalog + FAQ). Defaults to products.example.yaml
+      # baked into the image; mount the real one to override.
+      - ./products.yaml:/app/products.yaml:ro
+      # Optional .env override.
+      - ./.env:/app/.env:ro
+    # Only outbound ports needed (IMAP 993, SMTP 587/465, HTTPS).
+    network_mode: host

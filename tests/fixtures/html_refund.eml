@@ -1,0 +1,14 @@
+From: bob@example.com
+To: support@example.com
+Subject: Refund request for Widget Lite
+Message-ID: <bob-002@example.com>
+Date: Wed, 1 Mar 2024 10:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+<p>Hello,</p>
+<p>I would like a refund for my Widget Lite (WL-5567). It stopped working after two days.</p>
+<p>Please process this as soon as possible. I'm very unhappy with the quality.</p>
+<p>Bob</p>
+</body></html>

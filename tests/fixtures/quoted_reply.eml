@@ -1,0 +1,15 @@
+From: dave@example.com
+To: support@example.com
+Subject: Re: Your order #12345
+Message-ID: <dave-006@example.com>
+Date: Wed, 1 Mar 2024 14:00:00 +0000
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Thanks for the update. What's the expected delivery date?
+
+On 2024-03-01 09:00, support@example.com wrote:
+> Your order has shipped and will arrive within 3 business days.
+> Tracking number: 1Z999AA10123456784
+
+Dave

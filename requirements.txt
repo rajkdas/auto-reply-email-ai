@@ -1,0 +1,16 @@
+langchain>=0.3
+langchain-core>=0.3
+langchain-openai>=0.2
+# Swap/add as needed:
+#   langchain-anthropic
+#   langchain-google-genai
+#   langchain-ollama
+pydantic>=2.6
+pydantic-settings>=2.2
+aioimaplib>=1.1
+aiosmtplib>=3.0
+aiosqlite>=0.20
+rapidfuzz>=3.6
+beautifulsoup4>=4.12
+PyYAML>=6.0
+tzdata; platform_system == "Windows"

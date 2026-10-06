@@ -1,0 +1,27 @@
+[Unit]
+Description=ReplyDesk - async email auto-reply
+Documentation=https://github.com/your-org/replydesk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/replydesk
+EnvironmentFile=/opt/replydesk/.env
+ExecStart=/opt/replydesk/.venv/bin/python -m replydesk run
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/replydesk/data
+PrivateUsers=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

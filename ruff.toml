@@ -1,0 +1,22 @@
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+  "notebooks",   # .ipynb cells run top-to-bottom; import order rules don't apply
+]
+
+[lint]
+select = [
+  "E", "F", "W",   # pycodestyle / pyflakes
+  "I",             # isort
+  "B",             # bugbear
+  "UP",            # pyupgrade
+  "C4",            # comprehensions
+  "SIM",           # simplify
+]
+ignore = [
+  "E501",  # line length handled by formatter; long prompts are fine
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["E402"]   # tests import after sys.path manipulation
+"replydesk/chains.py" = ["E501"]  # prompt strings are intentionally long

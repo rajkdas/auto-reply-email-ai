@@ -1,0 +1,55 @@
+# ReplyDesk product catalog.
+#
+# Each product has:
+#   id           - stable identifier used in the audit log / dedupe key
+#   name         - canonical display name (what the reply should say)
+#   aliases      - alternative spellings / abbreviations to seed fuzzy matching
+#   sku_pattern  - optional regex matching SKU strings in the email body
+#   faq          - short FAQ text injected into the reply prompt as context
+#
+# Add or remove products freely; the matcher (LLM output + alias/regex + rapidfuzz)
+# handles whatever is here.
+
+products:
+  - id: widget_pro
+    name: Widget Pro
+    aliases:
+      - WidgetPro
+      - Widgt Pro
+      - WP
+    sku_pattern: "WP-\\d{3,4}"
+    faq: |
+      The Widget Pro ships within 2 business days from our EU warehouse.
+      Standard warranty is 24 months. For power issues, hold the reset button
+      for 10 seconds until the LED turns amber.
+
+  - id: widget_lite
+    name: Widget Lite
+    aliases:
+      - WidgetLite
+      - WL
+    sku_pattern: "WL-\\d{3,4}"
+    faq: |
+      The Widget Lite is USB-C powered (5V/2A). To reset, unplug for 30 seconds.
+      Replacement cables are available in the accessories store.
+
+  - id: cloud_sync
+    name: Cloud Sync
+    aliases:
+      - CloudSync
+      - Cloud Sync Pro
+    sku_pattern: "CS-\\d{3,4}"
+    faq: |
+      Cloud Sync requires firmware >= 2.1. Pairing failures are usually caused
+      by a stale token: sign out and sign back in to refresh it.
+
+  - id: premium_support
+    name: Premium Support Plan
+    aliases:
+      - Premium Support
+      - PremiumSupport
+      - PSP
+    sku_pattern: "PSP-\\d{4}"
+    faq: |
+      Premium Support offers 24/7 ticket response and a dedicated account
+      manager. Refunds on the plan are available within 14 days of renewal.
