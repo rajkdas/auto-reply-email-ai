@@ -232,10 +232,17 @@ async def fetch_unseen(settings: Settings) -> AsyncIterator[EmailMessage]:
     """
     client = await _connect_imap(settings)
     try:
-        # UID search for UNSEEN, fetch bodies without marking as seen (PEEK).
+        # Search for UNSEEN, fetch bodies without marking as seen (PEEK).
         # BODY.PEEK[] never sets \Seen, so emails stay UNSEEN until the
         # pipeline finishes and explicitly calls mark_seen().
-        typ, data = await client.uid("SEARCH", "UNSEEN")
+        #
+        # NOTE: aioimaplib's uid() helper only supports FETCH/STORE/COPY/MOVE/
+        # EXPUNGE - calling uid("SEARCH", ...) raises Abort. Use the dedicated
+        # uid_search() API instead, which sends a real "UID SEARCH". The
+        # results are UIDs (safe across re-syncs), unlike plain
+        # sequence-number SEARCH.
+        response = await client.uid_search("UNSEEN")
+        typ, data = response.status, response.lines
         if typ != "OK":
             log.warning("IMAP UID SEARCH UNSEEN failed: %s", typ)
             return
@@ -294,11 +301,30 @@ async def append_draft(settings: Settings, reply_email: Message) -> None:
 
 
 def _parse_uid_list(data: list) -> list[str]:
+    """Extract UID numbers from an untagged SEARCH/ESEARCH response line.
+
+    Handles both classic ``b"SEARCH 101 102"`` and ESEARCH
+    ``b"ESEARCH (UIDS 5:7 20)"`` formats, expanding colon ranges.
+    """
+    import re
+
     for item in data:
         if isinstance(item, bytes):
             txt = item.decode("ascii", errors="ignore").strip()
-            if txt:
-                return txt.split()
+            if not txt:
+                continue
+            uids: list[str] = []
+            for token in txt.split():
+                bare = token.strip("()")
+                m = re.fullmatch(r"(\d+):(?:(\d+))?", bare)
+                if m:
+                    start = int(m.group(1))
+                    end = int(m.group(2)) if m.group(2) else start
+                    uids.extend(str(u) for u in range(start, end + 1))
+                elif bare.isdigit():
+                    uids.append(bare)
+            if uids:
+                return uids
     return []
 
 
