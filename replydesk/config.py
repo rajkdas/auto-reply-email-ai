@@ -42,6 +42,11 @@ class Settings(BaseSettings):
 
     # --- Mode ----------------------------------------------------------
     mode: Mode = Mode.dry_run
+    # Safety post-check that downgrades a "send" decision to "draft" when the
+    # generated reply looks suspicious (needs_human flag, unauthorized URLs or
+    # money amounts). Set POST_CHECK_ENABLED=false in .env to disable it and
+    # let approved replies go out over SMTP unconditionally.
+    post_check_enabled: bool = True
 
     # --- LLM -----------------------------------------------------------
     llm_provider: str = "openai"

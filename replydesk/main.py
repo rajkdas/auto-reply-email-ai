@@ -193,12 +193,22 @@ class Pipeline:
                 error=str(exc),
             )
 
-        # 6) post-check (downgrade SEND -> DRAFT if suspicious)
-        if decision == "send":
+        # 6) post-check (downgrade SEND -> DRAFT if suspicious).
+        #    Controlled by POST_CHECK_ENABLED (default true). Set it to false
+        #    in .env to stop downgrades and let "send" decisions go straight
+        #    out over SMTP in live mode.
+        if decision == "send" and self.settings.post_check_enabled:
             reason = post_check(reply, self.settings, catalog_context)
             if reason is not None:
-                log.info("post_check downgraded id=%s reason=%s", email.message_id, reason)
+                log.info(
+                    "post_check downgraded id=%s reason=%s "
+                    "(set POST_CHECK_ENABLED=false to disable)",
+                    email.message_id, reason,
+                )
                 decision = "draft"
+        elif decision == "send":
+            log.debug("post_check disabled; keeping decision=send id=%s",
+                      email.message_id)
 
         # 7) persist "sending" before any side effect (crash recovery)
         if decision == "send" and self.settings.mode == Mode.live:
