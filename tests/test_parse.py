@@ -102,3 +102,59 @@ def test_synthetic_message_id_when_missing(settings):
     )
     em = parse_email_bytes(raw, settings)
     assert em.message_id.startswith("synthetic:")
+
+
+# ---------------------------------------------------------------------------
+# IMAP response parsing regressions (shapes taken from real Gmail DEBUG logs)
+# ---------------------------------------------------------------------------
+
+from replydesk.mail_io import _extract_body_bytes, _parse_uid_list
+
+
+def test_parse_uid_list_classic_search():
+    lines = [b"* SEARCH 20404 20405 23913", b"OEDE3 OK SEARCH completed (Success)"]
+    assert _parse_uid_list(lines) == ["20404", "20405", "23913"]
+
+
+def test_parse_uid_list_eshow_range():
+    lines = [b"* ESEARCH (TAG x) UIDLIST 5:7,20"]
+    # comma form is not expanded; colon ranges are
+    assert "6" in _parse_uid_list([b"* ESEARCH (UIDS 5:7 20)"])
+
+
+def test_extract_gmail_literal_shape():
+    """aioimaplib stores each literal as ONE whole bytes entry in .lines."""
+    body = b"Delivered-To: me@gmail.com\r\nSubject: hi\r\n\r\nplain text body\r\n"
+    lines = [
+        b"* 3499 FETCH (UID 23913 BODY[] {%d}" % len(body),
+        body,
+        b"OEDE4 OK Success",
+    ]
+    out = _extract_body_bytes(lines)
+    assert out is not None
+    assert out.startswith(b"Delivered-To:")
+    assert b"plain text body" in out
+
+
+def test_extract_tolerates_trailing_crlf():
+    body = b"From: a@b.c\r\n\r\nhello\r\n"
+    declared = len(body) - 2  # server counts without final CRLF sometimes
+    lines = [
+        b"* 1 FETCH (UID 5 BODY[] {%d}" % declared,
+        body,
+        b"TAG OK Success",
+    ]
+    out = _extract_body_bytes(lines)
+    assert out is not None and out.startswith(b"From:")
+
+
+def test_extract_falls_back_to_heuristic():
+    body = b"Message-ID: <x@y>\r\nSubject: s\r\n\r\nbody here\r\n"
+    lines = [body]  # no anchor line at all
+    out = _extract_body_bytes(lines)
+    assert out == body
+
+
+def test_extract_none_on_empty():
+    assert _extract_body_bytes([]) is None
+    assert _extract_body_bytes([b"TAG OK Success"]) is None
