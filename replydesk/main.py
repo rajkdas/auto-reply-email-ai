@@ -249,7 +249,10 @@ class Pipeline:
                 # leave 'sending' in store -> will be reclaimed as 'review'
                 raise
 
-        elif decision == "draft" and self.settings.mode == Mode.draft_only:
+        elif decision == "draft" and self.settings.mode != Mode.dry_run:
+            # draft_only mode, OR a live-mode send that post_check downgraded
+            # to draft - previously this fell through to the no-op branch and
+            # the generated reply was silently discarded ("no side effect").
             smtp_user = self.settings.smtp_user or self.settings.imap_user
             from_addr = (
                 f"{self.settings.smtp_from_name} <{smtp_user}>"
