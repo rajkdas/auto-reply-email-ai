@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Iterable
 from email.message import Message
 from email.mime.text import MIMEText
 from email.policy import default as default_policy
+from typing import Any
 
 import aioimaplib
 import aiosmtplib
@@ -202,7 +203,7 @@ def parse_email_bytes(raw: bytes, settings: Settings) -> EmailMessage:
         body_plain=body,
         raw_headers=raw_headers,
         is_automated=is_automated,
-        from_self=(own_addr and from_addr.lower() == own_addr),
+        from_self=bool(own_addr and from_addr.lower() == own_addr),
     )
 
 
@@ -222,27 +223,41 @@ async def _connect_imap(settings: Settings) -> aioimaplib.IMAP4_SSL:
 async def fetch_unseen(settings: Settings) -> AsyncIterator[EmailMessage]:
     """Yield each unseen email, marking them as seen only after the caller
     is done with them (the caller must call :func:`mark_seen`).
+
+    IMPORTANT: all IMAP commands here are UID-based (``UID SEARCH`` /
+    ``UID FETCH`` / ``UID STORE``). Plain ``SEARCH``/``FETCH`` return and
+    interpret *sequence numbers*, while ``STORE`` in :func:`mark_seen` uses
+    UIDs - mixing the two flags the wrong messages and makes dedupe/UID
+    bookkeeping unreliable.
     """
     client = await _connect_imap(settings)
     try:
         # UID search for UNSEEN, fetch bodies without marking as seen (PEEK).
-        typ, data = await client.search("UNSEEN")
+        # BODY.PEEK[] never sets \Seen, so emails stay UNSEEN until the
+        # pipeline finishes and explicitly calls mark_seen().
+        typ, data = await client.uid("SEARCH", "UNSEEN")
         if typ != "OK":
+            log.warning("IMAP UID SEARCH UNSEEN failed: %s", typ)
             return
         uids = _parse_uid_list(data)
+        log.info("found %d unseen message(s) in %r", len(uids), settings.imap_mailbox)
+        # Testing cap: process at most ``max_emails`` per run (0 = all).
+        if settings.max_emails and len(uids) > settings.max_emails:
+            log.info(
+                "limiting this run to the first %d of %d unseen message(s) "
+                "(MAX_EMAILS=%d); the rest stay UNSEEN for the next run",
+                settings.max_emails, len(uids), settings.max_emails,
+            )
+            uids = uids[: settings.max_emails]
         for uid in uids:
-            #typ, msg_data = await client.fetch(uid, "(BODY.PEEK[])")
-            typ, msg_data = await client.fetch(uid, "(RFC822)")
-            
+            typ, msg_data = await client.uid("FETCH", uid, "(BODY.PEEK[])")
             if typ != "OK":
+                log.warning("IMAP UID FETCH failed uid=%s: %s", uid, typ)
                 continue
-
-            # Immediately remove the 'Seen' flag that RFC822 triggered 
-            # to keep the email unread until the pipeline finishes.
-            await client.store(uid, "-FLAGS.SILENT", r"\Seen")
 
             raw = _extract_body_bytes(msg_data)
             if raw is None:
+                log.warning("no body bytes in FETCH response uid=%s", uid)
                 continue
             try:
                 em = parse_email_bytes(raw, settings)
@@ -259,7 +274,7 @@ async def mark_seen(settings: Settings, uid: str) -> None:
     """Mark a single message as seen by UID."""
     client = await _connect_imap(settings)
     try:
-        await client.store(uid, "+FLAGS.SILENT", r"\Seen")
+        await client.uid("STORE", uid, "+FLAGS.SILENT", r"\Seen")
     finally:
         with contextlib.suppress(Exception):
             await client.logout()
@@ -326,19 +341,32 @@ def build_reply_message(
 
 
 async def send_reply(settings: Settings, msg: Message) -> None:
-    """Send ``msg`` over SMTP using the configured TLS mode."""
-    kwargs = {
+    """Send ``msg`` over SMTP using the configured TLS mode.
+
+    aiosmtplib semantics (easy to get wrong):
+    - ``use_tls=True``   -> implicit TLS from the first byte (SMTPS, port 465)
+    - ``start_tls=True`` -> upgrade an existing plain connection (port 587)
+
+    Previously this mapped "ssl" -> use_tls and *everything else* ->
+    start_tls, so a misconfigured/empty SMTP_SECURITY silently forced
+    STARTTLS against an SSL-only port (and vice versa), making sends hang
+    or fail. Now the mode is explicit and defaults to starttls.
+    """
+    security = getattr(settings.smtp_security, "value", str(settings.smtp_security))
+    kwargs: dict[str, Any] = {
         "hostname": settings.smtp_host,
         "port": settings.smtp_port,
         "username": settings.smtp_user,
         "password": settings.smtp_password,
+        "timeout": 30,
     }
-    if settings.smtp_security.value == "ssl":
+    if security == "ssl":
         kwargs["use_tls"] = True
-    else:
+    elif security == "starttls":
         kwargs["start_tls"] = True
-    async with aiosmtplib.SMTP(**kwargs) as smtp:  # type: ignore[arg-type]
-        await smtp.send_message(msg)
+    else:  # pragma: no cover - enum should prevent this
+        raise ValueError(f"unknown SMTP_SECURITY: {security!r}")
+    await aiosmtplib.send(msg, **kwargs)
 
 
 # ---------------------------------------------------------------------------
