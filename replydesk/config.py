@@ -11,6 +11,11 @@ from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+import os
+from dotenv import load_dotenv
+
+# Force the .env variables into the system environment
+load_dotenv()
 
 class Mode(str, Enum):
     """Operating mode for the system."""

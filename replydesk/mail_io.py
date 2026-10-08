@@ -226,14 +226,21 @@ async def fetch_unseen(settings: Settings) -> AsyncIterator[EmailMessage]:
     client = await _connect_imap(settings)
     try:
         # UID search for UNSEEN, fetch bodies without marking as seen (PEEK).
-        typ, data = await client.uid("search", "UNSEEN")
+        typ, data = await client.search("UNSEEN")
         if typ != "OK":
             return
         uids = _parse_uid_list(data)
         for uid in uids:
-            typ, msg_data = await client.uid("fetch", uid, "(BODY.PEEK[])")
+            #typ, msg_data = await client.fetch(uid, "(BODY.PEEK[])")
+            typ, msg_data = await client.fetch(uid, "(RFC822)")
+            
             if typ != "OK":
                 continue
+
+            # Immediately remove the 'Seen' flag that RFC822 triggered 
+            # to keep the email unread until the pipeline finishes.
+            await client.store(uid, "-FLAGS.SILENT", r"\Seen")
+
             raw = _extract_body_bytes(msg_data)
             if raw is None:
                 continue
@@ -252,7 +259,7 @@ async def mark_seen(settings: Settings, uid: str) -> None:
     """Mark a single message as seen by UID."""
     client = await _connect_imap(settings)
     try:
-        await client.uid("STORE", uid, "+FLAGS.SILENT", r"\Seen")
+        await client.store(uid, "+FLAGS.SILENT", r"\Seen")
     finally:
         with contextlib.suppress(Exception):
             await client.logout()
