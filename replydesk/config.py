@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     poll_seconds: int = 30
     workers: int = 4
     max_concurrency: int = 4
+    # --- Testing limits -------------------------------------------------
+    # Max number of emails to process per ``once``/poll iteration.
+    # 0 = no limit (process every unseen email). Set MAX_EMAILS=1 while
+    # testing so the run stops after working on a single email.
+    max_emails: int = 0
 
     # --- Safety knobs --------------------------------------------------
     products_file: str = "products.yaml"

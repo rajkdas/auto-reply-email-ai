@@ -23,7 +23,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import aioimaplib
+
 from .chains import (
+    _fake_llm_enabled,
     analysis_inputs,
     build_analysis_chain,
     build_reply_chain,
@@ -341,8 +344,13 @@ async def run_once(
             results.append(res)
             # Mark the message as seen on IMAP only after we've committed
             # to a final outcome, so a crash mid-processing re-fetches it.
+            # NOTE: this runs in *every* mode (including dry_run). If we
+            # skipped marking in dry_run, every email would be re-fetched
+            # forever and - combined with DB dedupe - just logged as
+            # "already_processed", which looks exactly like a blank,
+            # non-functional run.
             uid = em.raw_headers.get("x-imap-uid")
-            if uid and settings.mode != Mode.dry_run:
+            if uid:
                 try:
                     await mark_seen(settings, uid)
                 except Exception as exc:  # pragma: no cover - best effort
@@ -381,8 +389,14 @@ async def run_forever(settings: Settings | None = None) -> None:
         while not stop.is_set():
             try:
                 await run_once(settings, source=_imap_source(settings), pipeline=pipeline)
+            except aioimaplib.IMAP4.error as exc:
+                # Most common cause: bad IMAP_HOST/credentials or blocked login.
+                log.exception("IMAP error during poll (check IMAP_* in .env): %s", exc)
+            except OSError as exc:
+                # DNS failure / connection refused (e.g. placeholder host).
+                log.exception("Network error during poll (check IMAP_HOST/PORT): %s", exc)
             except Exception as exc:
-                log.error("run_once iteration failed: %s", exc)
+                log.exception("run_once iteration failed: %s", exc)
             try:
                 await asyncio.wait_for(stop.wait(), timeout=settings.poll_seconds)
             except asyncio.TimeoutError:
@@ -401,6 +415,45 @@ def _setup_logging(level: str) -> None:
     )
 
 
+def _validate_settings(settings: Settings) -> list[str]:
+    """Return a list of human-readable configuration problems.
+
+    Empty list == config looks good. This exists because every previous
+    failure mode was silent: IMAP login errors were swallowed by
+    ``run_forever``'s try/except, so the user saw a blank screen with no
+    error even though nothing could ever be fetched or sent.
+    """
+    problems: list[str] = []
+
+    if not settings.imap_host or "example.com" in settings.imap_host:
+        problems.append("IMAP_HOST is not set (still the example.com placeholder)")
+    if not settings.imap_user:
+        problems.append("IMAP_USER is empty")
+    if not settings.imap_password:
+        problems.append("IMAP_PASSWORD is empty (Gmail requires an App Password)")
+
+    if settings.mode == Mode.live:
+        if not settings.smtp_host or "example.com" in settings.smtp_host:
+            problems.append("SMTP_HOST is not set (required when MODE=live)")
+        if not settings.smtp_password:
+            problems.append("SMTP_PASSWORD is empty (required when MODE=live)")
+        if (settings.openai_api_key or "").strip() in {"", "changeme"} and \
+                settings.llm_provider == "openai" and not _fake_llm_enabled():
+            problems.append(
+                "OPENAI_API_KEY is missing but MODE=live and FAKE_LLM is off - "
+                "every LLM call will fail"
+            )
+
+    products_path = Path(settings.products_file)
+    if not products_path.exists():
+        problems.append(
+            f"PRODUCTS_FILE '{settings.products_file}' does not exist "
+            "(copy products.example.yaml to products.yaml)"
+        )
+
+    return problems
+
+
 def _cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="replydesk",
@@ -416,10 +469,34 @@ def _cli(argv: list[str] | None = None) -> int:
         help="For 'replay': directory of .eml files, or a single .eml file.",
     )
     parser.add_argument("--log-level", default=None)
+    parser.add_argument(
+        "--max-emails", type=int, default=None, metavar="N",
+        help="Process at most N emails this run (testing helper). "
+             "0 = no limit. Overrides MAX_EMAILS from .env.",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
+    if args.max_emails is not None:
+        if args.max_emails < 0:
+            print("--max-emails must be >= 0", file=sys.stderr)
+            return 2
+        settings = settings.model_copy(update={"max_emails": args.max_emails})
     _setup_logging(args.log_level or settings.log_level)
+
+    if args.command in ("run", "once"):
+        problems = _validate_settings(settings)
+        for p in problems:
+            log.warning("CONFIG PROBLEM: %s", p)
+        if problems:
+            print(
+                f"\nReplyDesk found {len(problems)} configuration problem(s):\n"
+                + "\n".join(f"  - {p}" for p in problems)
+                + "\nFix your .env file, then re-run. "
+                  "(Tip: python -m replydesk once --log-level DEBUG)\n",
+                file=sys.stderr,
+            )
+            return 2
 
     if args.command == "run":
         asyncio.run(run_forever(settings))
