@@ -212,8 +212,18 @@ def parse_email_bytes(raw: bytes, settings: Settings) -> EmailMessage:
 # ---------------------------------------------------------------------------
 
 async def _connect_imap(settings: Settings) -> aioimaplib.IMAP4_SSL:
-    """Connect + login + select INBOX. Raises on failure."""
-    client = aioimaplib.IMAP4_SSL(host=settings.imap_host, port=settings.imap_port)
+    """Connect + login + select INBOX. Raises on failure.
+
+    ``timeout`` is aioimaplib's *per-command* timeout (default 10s). Gmail
+    logins over slow/IPv6 links can exceed that, so we raise it to 60s.
+    NOTE: aioimaplib passes this straight into ``asyncio.wait_for``, which
+    requires ``float`` - an ``int`` raises TypeError there, hence ``60.0``.
+    """
+    client = aioimaplib.IMAP4_SSL(
+        host=settings.imap_host,
+        port=settings.imap_port,
+        timeout=60.0,
+    )
     await client.wait_hello_from_server()
     await client.login(settings.imap_user, settings.imap_password)
     await client.select(settings.imap_mailbox)
@@ -242,22 +252,39 @@ async def fetch_unseen(settings: Settings) -> AsyncIterator[EmailMessage]:
         # results are UIDs (safe across re-syncs), unlike plain
         # sequence-number SEARCH.
         response = await client.uid_search("UNSEEN")
-        typ, data = response.status, response.lines
+        # aioimaplib's ``Response`` is a namedtuple with fields
+        # ``result`` ("OK"/"NO"/"BAD") and ``lines`` (untagged + tagged
+        # response byte-strings). It has NO ``status`` or ``data``
+        # attributes - reading those raises AttributeError. Verified against
+        # aioimaplib 2.0.1: Response._fields == ('result', 'lines').
+        typ, data = response.result, response.lines
         if typ != "OK":
             log.warning("IMAP UID SEARCH UNSEEN failed: %s", typ)
             return
         uids = _parse_uid_list(data)
         log.info("found %d unseen message(s) in %r", len(uids), settings.imap_mailbox)
+
+        # Process NEWEST FIRST: IMAP UIDs increase monotonically within a
+        # mailbox (UIDVALIDITY is stable for Gmail INBOX), so sorting by
+        # descending UID gives us the most recent messages at the front.
+        # This matters especially with MAX_EMAILS - you want the cap to
+        # apply to fresh mail, not years-old backlog like UID 20404.
+        uids.sort(key=lambda u: int(u), reverse=True)
+
         # Testing cap: process at most ``max_emails`` per run (0 = all).
         if settings.max_emails and len(uids) > settings.max_emails:
             log.info(
-                "limiting this run to the first %d of %d unseen message(s) "
+                "limiting this run to the newest %d of %d unseen message(s) "
                 "(MAX_EMAILS=%d); the rest stay UNSEEN for the next run",
                 settings.max_emails, len(uids), settings.max_emails,
             )
             uids = uids[: settings.max_emails]
         for uid in uids:
-            typ, msg_data = await client.uid("FETCH", uid, "(BODY.PEEK[])")
+            # aioimaplib has no ``uid_fetch()`` method; the generic ``uid()``
+            # dispatcher supports FETCH/STORE/COPY/MOVE/EXPUNGE and returns
+            # the same Response namedtuple as every other command.
+            fetch = await client.uid("FETCH", uid, "(BODY.PEEK[])")
+            typ, msg_data = fetch.result, fetch.lines
             if typ != "OK":
                 log.warning("IMAP UID FETCH failed uid=%s: %s", uid, typ)
                 continue
@@ -288,13 +315,21 @@ async def mark_seen(settings: Settings, uid: str) -> None:
 
 
 async def append_draft(settings: Settings, reply_email: Message) -> None:
-    """Append a draft reply to the IMAP Drafts folder."""
+    """Append a draft reply to the IMAP Drafts folder.
+
+    aioimaplib's real signature is
+    ``append(message_bytes: bytes, mailbox: str = 'INBOX', flags: str = None,
+    date: Any = None)`` - message bytes FIRST, and ``flags`` is a plain
+    string that gets wrapped in parentheses (a list would be mangled into
+    ``"('\\Draft')"``). Passing ``("Drafts", raw, ...)`` raised
+    AttributeError/protocol errors at runtime.
+    """
     client = await _connect_imap(settings)
     try:
         raw = reply_email.as_bytes()
-        await client.append(
-            "Drafts", raw, flags=[r"\Draft"], date=None
-        )
+        resp = await client.append(raw, "Drafts", flags=r"\Draft")
+        if resp.result != "OK":
+            raise RuntimeError(f"IMAP APPEND to Drafts failed: {resp.result}")
     finally:
         with contextlib.suppress(Exception):
             await client.logout()
@@ -328,13 +363,100 @@ def _parse_uid_list(data: list) -> list[str]:
     return []
 
 
-def _extract_body_bytes(msg_data: list) -> bytes | None:
-    for item in msg_data:
-        if isinstance(item, tuple) and len(item) == 2:
-            meta, body = item
-            if isinstance(body, bytes):
-                return body
+_FETCH_ANCHOR_RE = re.compile(
+    rb"(?<![0-9])[0-9]+ FETCH \(.*?\{([0-9]+)\}", re.IGNORECASE
+)
+_TAGGED_STATUS_RE = re.compile(rb"^[A-Za-z]{4}[0-9]{1,4} (OK|NO|BAD)")
+
+
+def _join_fetch_lines(resp_lines: list) -> bytes | None:
+    """Re-assemble the raw RFC822 bytes from aioimaplib's FETCH response.
+
+    Verified against the aioimaplib source (``Command``, ``FetchCommand``,
+    ``IMAP4ClientProtocol._handle_responses`` / ``_response_done``):
+
+    * ``Response.lines`` holds one entry per piece of the response. The
+      literal body arrives as ONE whole entry, but it is stored as a
+      ``bytearray`` (``append_literal_data`` appends ``_resp_literal_data``
+      directly), so we must accept both ``bytes`` and ``bytearray`` -
+      filtering on ``isinstance(item, bytes)`` alone silently drops the
+      entire message body.
+    * Gmail's ``UID FETCH n (BODY.PEEK[])`` produces::
+
+          [b'* 3499 FETCH (UID 23913 BODY[] {7303}',      # untagged marker
+           bytearray(b'<full 7303-byte RFC822 message>'), # the literal
+           b')',                                          # closing FETCH paren
+           b'Success']                                   # tagged text AFTER
+                                                          # the command tag
+
+    * ``_response_done`` appends only the text after the tag, so joining all
+      byte-ish entries reconstructs the server octets except that single
+      tag - harmless, because we anchor on the ``{size}`` marker and take
+      exactly ``size`` bytes from there (the trailing ``)``/status text sit
+      outside the slice).
+    """
+    blobs = [bytes(item) for item in resp_lines
+             if isinstance(item, (bytes, bytearray))]
+    if not blobs:
+        return None
+
+    joined = b"".join(blobs)
+
+    # --- Primary: anchored literal-size extraction --------------------------
+    # Lookbehind prevents matching "NNN FETCH (" inside the message itself.
+    markers = list(_FETCH_ANCHOR_RE.finditer(joined))
+    if markers:
+        m = markers[-1]
+        size = int(m.group(1))
+        tail = joined[m.end():]
+        # Sanity: a real message literal starts with an RFC822 header and
+        # has a blank line before the body. Require both before trusting
+        # the slice, so an unexpected shape falls through to heuristics.
+        blank = tail.find(b"\r\n\r\n")
+        if blank == -1:
+            blank = tail.find(b"\n\n")
+        if len(tail) >= size and blank != -1 and b":" in tail[:max(blank, 1)]:
+            return tail[:size]
+
+    # --- Fallback 1: the literal stored as its own whole entry --------------
+    literal_sizes = [int(mm.group(1)) for mm in markers]
+    for item in blobs:
+        if _TAGGED_STATUS_RE.match(item) or _FETCH_ANCHOR_RE.search(item):
+            continue
+        looks_like_mail = (
+            re.match(rb"^[A-Za-z][A-Za-z0-9_-]*:", item) is not None
+            and (b"\r\n\r\n" in item or b"\n\n" in item)
+        )
+        if not looks_like_mail:
+            continue
+        if literal_sizes and len(item.rstrip(b"\r\n")) < max(literal_sizes):
+            continue  # partial fragment - keep looking
+        return item
+
+    # --- Fallback 2: legacy imaplib-style (meta, body) tuples ---------------
+    for item in resp_lines:
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (bytes, bytearray)):
+            if len(item[1]) > 50:
+                return bytes(item[1])
+
+    # --- Fallback 3: largest non-status blob (never silently skip) ---------
+    candidates = [item for item in blobs
+                  if len(item) > 50
+                  and not _TAGGED_STATUS_RE.match(item)
+                  and not _FETCH_ANCHOR_RE.search(item)]
+    if candidates:
+        return max(candidates, key=len)
     return None
+
+
+def _extract_body_bytes(resp_lines: list) -> bytes | None:
+    """Pull the raw RFC822 bytes out of a UID FETCH response.
+
+    NOTE: do NOT rstrip the result - the declared literal size is exact,
+    and trimming trailing CRLF would corrupt quoted-printable soft line
+    breaks (``...now=\r\n.\r\n``) inside the message body.
+    """
+    return _join_fetch_lines(resp_lines)
 
 
 # ---------------------------------------------------------------------------
