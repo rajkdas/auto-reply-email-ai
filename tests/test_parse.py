@@ -155,6 +155,47 @@ def test_extract_falls_back_to_heuristic():
     assert out == body
 
 
+def test_extract_handles_bytearray_literal():
+    """Regression: aioimaplib appends the FETCH literal as a *bytearray*
+    (Command.append_literal_data stores _resp_literal_data directly).
+    Filtering entries with ``isinstance(item, bytes)`` dropped it and the
+    pipeline logged 'no body bytes in FETCH response' for every real email.
+    """
+    body = bytearray(
+        b"Delivered-To: me@gmail.com\r\nFrom: a@b.c\r\nSubject: hi\r\n\r\n"
+        b"Hi, your product widget pro is not working.\r\n"
+    )
+    lines = [
+        b"* 3499 FETCH (UID 23913 BODY[] {%d}" % len(body),
+        body,          # <-- bytearray, exactly what aioimaplib yields
+        b")",          # closing FETCH paren (separate entry)
+        b"Success",    # tagged text AFTER the tag (_response_done strips it)
+    ]
+    out = _extract_body_bytes(lines)
+    assert out is not None, "bytearray literal must not be silently dropped"
+    assert out.startswith(b"Delivered-To:")
+    assert b"widget pro is not working" in out
+    assert len(out) == len(body)
+    assert not out.endswith(b")")  # trailing paren stays outside the slice
+
+
+def test_extract_joins_split_marker_and_status():
+    """Even if the literal were split across entries, anchored extraction
+    reassembles it from the joined stream."""
+    body = (
+        b"From: a@b.c\r\nSubject: s\r\n\r\n" + b"x" * 300 + b"\r\n"
+    )
+    lines = [
+        b"* 7 FETCH (UID 99 BODY[] {%d}" % len(body),
+        body[:150],
+        body[150:],
+        b")",
+        b"OK Success",
+    ]
+    out = _extract_body_bytes(lines)
+    assert out == body
+
+
 def test_extract_none_on_empty():
     assert _extract_body_bytes([]) is None
     assert _extract_body_bytes([b"TAG OK Success"]) is None

@@ -363,80 +363,100 @@ def _parse_uid_list(data: list) -> list[str]:
     return []
 
 
+_FETCH_ANCHOR_RE = re.compile(
+    rb"(?<![0-9])[0-9]+ FETCH \(.*?\{([0-9]+)\}", re.IGNORECASE
+)
+_TAGGED_STATUS_RE = re.compile(rb"^[A-Za-z]{4}[0-9]{1,4} (OK|NO|BAD)")
+
+
+def _join_fetch_lines(resp_lines: list) -> bytes | None:
+    """Re-assemble the raw RFC822 bytes from aioimaplib's FETCH response.
+
+    Verified against the aioimaplib source (``Command``, ``FetchCommand``,
+    ``IMAP4ClientProtocol._handle_responses`` / ``_response_done``):
+
+    * ``Response.lines`` holds one entry per piece of the response. The
+      literal body arrives as ONE whole entry, but it is stored as a
+      ``bytearray`` (``append_literal_data`` appends ``_resp_literal_data``
+      directly), so we must accept both ``bytes`` and ``bytearray`` -
+      filtering on ``isinstance(item, bytes)`` alone silently drops the
+      entire message body.
+    * Gmail's ``UID FETCH n (BODY.PEEK[])`` produces::
+
+          [b'* 3499 FETCH (UID 23913 BODY[] {7303}',      # untagged marker
+           bytearray(b'<full 7303-byte RFC822 message>'), # the literal
+           b')',                                          # closing FETCH paren
+           b'Success']                                   # tagged text AFTER
+                                                          # the command tag
+
+    * ``_response_done`` appends only the text after the tag, so joining all
+      byte-ish entries reconstructs the server octets except that single
+      tag - harmless, because we anchor on the ``{size}`` marker and take
+      exactly ``size`` bytes from there (the trailing ``)``/status text sit
+      outside the slice).
+    """
+    blobs = [bytes(item) for item in resp_lines
+             if isinstance(item, (bytes, bytearray))]
+    if not blobs:
+        return None
+
+    joined = b"".join(blobs)
+
+    # --- Primary: anchored literal-size extraction --------------------------
+    # Lookbehind prevents matching "NNN FETCH (" inside the message itself.
+    markers = list(_FETCH_ANCHOR_RE.finditer(joined))
+    if markers:
+        m = markers[-1]
+        size = int(m.group(1))
+        tail = joined[m.end():]
+        # Sanity: a real message literal starts with an RFC822 header and
+        # has a blank line before the body. Require both before trusting
+        # the slice, so an unexpected shape falls through to heuristics.
+        blank = tail.find(b"\r\n\r\n")
+        if blank == -1:
+            blank = tail.find(b"\n\n")
+        if len(tail) >= size and blank != -1 and b":" in tail[:max(blank, 1)]:
+            return tail[:size]
+
+    # --- Fallback 1: the literal stored as its own whole entry --------------
+    literal_sizes = [int(mm.group(1)) for mm in markers]
+    for item in blobs:
+        if _TAGGED_STATUS_RE.match(item) or _FETCH_ANCHOR_RE.search(item):
+            continue
+        looks_like_mail = (
+            re.match(rb"^[A-Za-z][A-Za-z0-9_-]*:", item) is not None
+            and (b"\r\n\r\n" in item or b"\n\n" in item)
+        )
+        if not looks_like_mail:
+            continue
+        if literal_sizes and len(item.rstrip(b"\r\n")) < max(literal_sizes):
+            continue  # partial fragment - keep looking
+        return item
+
+    # --- Fallback 2: legacy imaplib-style (meta, body) tuples ---------------
+    for item in resp_lines:
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (bytes, bytearray)):
+            if len(item[1]) > 50:
+                return bytes(item[1])
+
+    # --- Fallback 3: largest non-status blob (never silently skip) ---------
+    candidates = [item for item in blobs
+                  if len(item) > 50
+                  and not _TAGGED_STATUS_RE.match(item)
+                  and not _FETCH_ANCHOR_RE.search(item)]
+    if candidates:
+        return max(candidates, key=len)
+    return None
+
+
 def _extract_body_bytes(resp_lines: list) -> bytes | None:
     """Pull the raw RFC822 bytes out of a UID FETCH response.
 
-    ``aioimaplib`` returns ``Response(result, lines)`` where ``lines`` is a
-    list of *separate* byte strings - it does NOT bundle the literal into a
-    ``(meta, body)`` tuple like imaplib does. For a Gmail ``UID FETCH n
-    (BODY.PEEK[])`` the lines look like::
-
-        [b'* 3499 FETCH (UID 23913 BODY[] {7303}',   # header + literal size
-         b'<...7303 bytes of raw RFC822 mail...>',    # the literal itself
-         b'OEDE4 OK Success']                          # tagged completion
-
-    Strategy (in order):
-    1. Anchor on the ``N FETCH (... {size})`` marker line and return the
-       following bytes entry whose length matches ``size`` (literal data is
-       appended as ONE whole entry by aioimaplib's FetchCommand; we tolerate
-       ±2 bytes of CRLF stripping and re-accumulate split chunks too).
-    2. Heuristic fallback: any blob that starts with an RFC822 ``Name:``
-       header AND contains a blank line ("\\r\\n\\r\\n") is a full message.
-    3. Last resort: the largest candidate blob - never silently skip a
-       message because of an unexpected response shape.
+    NOTE: do NOT rstrip the result - the declared literal size is exact,
+    and trimming trailing CRLF would corrupt quoted-printable soft line
+    breaks (``...now=\r\n.\r\n``) inside the message body.
     """
-    anchor_re = re.compile(
-        rb"\d+\s+FETCH\s*\(.*?\{(\d+)\}", re.IGNORECASE | re.DOTALL
-    )
-    header_re = re.compile(rb"^[A-Za-z][A-Za-z0-9_-]*:")
-    blank_line_re = re.compile(rb"\r?\n\r?\n")
-
-    def _is_message_blob(b: bytes) -> bool:
-        return bool(header_re.search(b[:200])) and bool(blank_line_re.search(b))
-
-    # --- Pass 1: literal-size anchored extraction -------------------------
-    best: bytes | None = None
-    pending_size: int | None = None
-    accumulated = bytearray()
-    for item in resp_lines:
-        if not isinstance(item, bytes):
-            continue
-        if pending_size is None:
-            m = anchor_re.search(item)
-            if m:
-                pending_size = int(m.group(1))
-                accumulated = bytearray()
-            continue
-        # We are expecting literal bytes after a {size} marker.
-        accumulated.extend(item)
-        if len(accumulated) >= pending_size:
-            body = bytes(accumulated[:pending_size])
-            if best is None or len(body) > len(best):
-                best = body
-            pending_size = None
-            accumulated = bytearray()
-    if best is not None:
-        return best
-
-    # --- Pass 2: header + blank-line heuristic ----------------------------
-    candidates = [item for item in resp_lines
-                  if isinstance(item, bytes) and _is_message_blob(item)]
-    if candidates:
-        return max(candidates, key=len)
-
-    # --- Pass 3: legacy imaplib-style (meta, body) tuples ------------------
-    for item in resp_lines:
-        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], bytes):
-            return item[1]
-
-    # --- Pass 4: last resort - biggest blob that isn't the tagged status ---
-    blobs = [item for item in resp_lines
-             if isinstance(item, bytes) and len(item) > 50
-             and not anchor_re.search(item)
-             and not re.match(rb"^\w{4}\d+ (OK|NO|BAD)", item)]
-    if blobs:
-        return max(blobs, key=len)
-    return None
+    return _join_fetch_lines(resp_lines)
 
 
 # ---------------------------------------------------------------------------
