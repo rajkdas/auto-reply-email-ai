@@ -102,3 +102,99 @@ def test_synthetic_message_id_when_missing(settings):
     )
     em = parse_email_bytes(raw, settings)
     assert em.message_id.startswith("synthetic:")
+
+
+# ---------------------------------------------------------------------------
+# IMAP response parsing regressions (shapes taken from real Gmail DEBUG logs)
+# ---------------------------------------------------------------------------
+
+from replydesk.mail_io import _extract_body_bytes, _parse_uid_list
+
+
+def test_parse_uid_list_classic_search():
+    lines = [b"* SEARCH 20404 20405 23913", b"OEDE3 OK SEARCH completed (Success)"]
+    assert _parse_uid_list(lines) == ["20404", "20405", "23913"]
+
+
+def test_parse_uid_list_eshow_range():
+    # comma form is not expanded; colon ranges are
+    assert "6" in _parse_uid_list([b"* ESEARCH (UIDS 5:7 20)"])
+
+
+def test_extract_gmail_literal_shape():
+    """aioimaplib stores each literal as ONE whole bytes entry in .lines."""
+    body = b"Delivered-To: me@gmail.com\r\nSubject: hi\r\n\r\nplain text body\r\n"
+    lines = [
+        b"* 3499 FETCH (UID 23913 BODY[] {%d}" % len(body),
+        body,
+        b"OEDE4 OK Success",
+    ]
+    out = _extract_body_bytes(lines)
+    assert out is not None
+    assert out.startswith(b"Delivered-To:")
+    assert b"plain text body" in out
+
+
+def test_extract_tolerates_trailing_crlf():
+    body = b"From: a@b.c\r\n\r\nhello\r\n"
+    declared = len(body) - 2  # server counts without final CRLF sometimes
+    lines = [
+        b"* 1 FETCH (UID 5 BODY[] {%d}" % declared,
+        body,
+        b"TAG OK Success",
+    ]
+    out = _extract_body_bytes(lines)
+    assert out is not None and out.startswith(b"From:")
+
+
+def test_extract_falls_back_to_heuristic():
+    body = b"Message-ID: <x@y>\r\nSubject: s\r\n\r\nbody here\r\n"
+    lines = [body]  # no anchor line at all
+    out = _extract_body_bytes(lines)
+    assert out == body
+
+
+def test_extract_handles_bytearray_literal():
+    """Regression: aioimaplib appends the FETCH literal as a *bytearray*
+    (Command.append_literal_data stores _resp_literal_data directly).
+    Filtering entries with ``isinstance(item, bytes)`` dropped it and the
+    pipeline logged 'no body bytes in FETCH response' for every real email.
+    """
+    body = bytearray(
+        b"Delivered-To: me@gmail.com\r\nFrom: a@b.c\r\nSubject: hi\r\n\r\n"
+        b"Hi, your product widget pro is not working.\r\n"
+    )
+    lines = [
+        b"* 3499 FETCH (UID 23913 BODY[] {%d}" % len(body),
+        body,          # <-- bytearray, exactly what aioimaplib yields
+        b")",          # closing FETCH paren (separate entry)
+        b"Success",    # tagged text AFTER the tag (_response_done strips it)
+    ]
+    out = _extract_body_bytes(lines)
+    assert out is not None, "bytearray literal must not be silently dropped"
+    assert out.startswith(b"Delivered-To:")
+    assert b"widget pro is not working" in out
+    assert len(out) == len(body)
+    assert not out.endswith(b")")  # trailing paren stays outside the slice
+
+
+def test_extract_joins_split_marker_and_status():
+    """Even if the literal were split across entries, anchored extraction
+    reassembles it from the joined stream."""
+    body = (
+        b"From: a@b.c\r\nSubject: s\r\n\r\n" + b"x" * 300 + b"\r\n"
+    )
+    lines = [
+        b"* 7 FETCH (UID 99 BODY[] {%d}" % len(body),
+        body[:150],
+        body[150:],
+        b")",
+        b"OK Success",
+    ]
+    out = _extract_body_bytes(lines)
+    assert out == body
+
+
+def test_extract_none_on_empty():
+    assert _extract_body_bytes([]) is None
+    assert _extract_body_bytes([b"TAG OK Success"]) is None

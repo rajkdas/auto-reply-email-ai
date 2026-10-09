@@ -261,13 +261,18 @@ replies twice; they sit there for a human to look at. Note: a row in `review` st
 
 ## Docker
 
-`Dockerfile` and `docker-compose.yml` are included. The compose file mounts a `./data` volume for the
-SQLite DB and restarts automatically:
+`Dockerfile` and `docker-compose.yml` are included. The image runs as a
+non-root user, defaults to `MODE=dry_run`, keeps the SQLite DB at
+`/data/replydesk.db` (bind-mounted from `./data`), and never bakes secrets
+into layers — credentials come from your `.env` via `env_file:`. Outbound-only
+traffic (IMAP 993, SMTP 465/587, HTTPS) uses the default bridge network;
+no ports need publishing.
 
 ```bash
+cp .env.example .env      # fill in IMAP/SMTP/LLM creds; set MODE + DB_PATH=/data/replydesk.db
+mkdir -p data             # bind-mount target for the SQLite DB
 docker compose up -d
 docker compose logs -f
-```
 
 ---
 

@@ -87,7 +87,14 @@ Rules:
 - Only link to domains in the allowed-domain list: {{{{allowed}}}}.
 - If the customer mentions a product not in the catalog context, do not
   pretend to know it. Instead say that a teammate will follow up.
-- If you are not confident in the right answer, set needs_human=true.
+- Set needs_human=true ONLY if ALL of these fail: the question is fully
+  answerable from the catalog context above, AND every fact you state comes
+  verbatim from that catalog, AND no link you include is on an allowed
+  domain. A simple, polite acknowledgment plus a general troubleshooting tip
+  (or "we'll follow up shortly") is safe and should use needs_human=false.
+  Do NOT set needs_human=true merely because the customer asks something
+  outside the catalog - instead reply courteously and say a teammate will
+  follow up.
 - Subject line should start with "Re:" and be a short, neutral summary.
 """
 

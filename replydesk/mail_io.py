@@ -187,10 +187,13 @@ def parse_email_bytes(raw: bytes, settings: Settings) -> EmailMessage:
     if len(body) > settings.max_body_chars:
         body = body[: settings.max_body_chars] + "\n…[truncated]"
 
+
     raw_headers = {
         k: v
         for k, v in msg.items()
-        if k.lower() in _AUTOMATED_HEADERS or k.lower() in {"message-id", "references", "in-reply-to"}
+        if k.lower() in _AUTOMATED_HEADERS
+        or k.lower() in {"message-id", "references", "in-reply-to",
+                         "thread-topic", "thread-index"}
     }
 
     return EmailMessage(
@@ -470,19 +473,49 @@ def build_reply_message(
     reply_body: str,
     from_addr: str,
 ) -> Message:
-    """Build an outbound email with correct threading headers."""
-    if reply_subject and not reply_subject.lower().startswith("re:"):
-        subject = f"Re: {original.subject}"
-    else:
-        subject = reply_subject or f"Re: {original.subject}"
+    """Build an outbound email with correct threading headers.
+
+    Universal threading fix (works for Gmail, Outlook, Yahoo, iCloud and
+    custom-domain mail - all of them honour RFC 5322 threading):
+
+    1. Subject MUST match the original after Re:/Fwd: normalization. Gmail
+       falls back to subject-only grouping; any extra "Re: Re:" breaks it.
+    2. References = original's full References chain + its Message-ID, so
+       every client can reconstruct the whole conversation, not just the
+       last hop.
+    3. In-Reply-To points at the exact Message-ID we parsed (never empty,
+       never synthetic).
+    """
+    # --- 1) Normalize the subject exactly once -----------------------------
+    base_subject = re.sub(
+        r"^\s*((re|fwd?|fw)\s*:\s*)+", "", original.subject or "", flags=re.IGNORECASE
+    )
+    subject = f"Re: {base_subject}" if base_subject else "Re:"
 
     msg = MIMEText(reply_body, _charset="utf-8")
     msg["From"] = from_addr
     msg["To"] = original.from_addr
     msg["Subject"] = subject
-    if original.message_id:
-        msg["In-Reply-To"] = original.message_id
-        msg["References"] = original.message_id
+
+    # --- 2/3) Threading headers --------------------------------------------
+    orig_id = (original.message_id or "").strip()
+    if orig_id and not orig_id.startswith("synthetic:"):
+        parent_refs = (original.raw_headers.get("References") or "").strip()
+        refs_parts = [p for p in parent_refs.split() if p.startswith("<")]
+        if orig_id not in refs_parts:
+            refs_parts.append(orig_id)
+        msg["In-Reply-To"] = orig_id
+        msg["References"] = " ".join(refs_parts)
+
+        # Optional extras some clients use in addition to the standard ones.
+        thread_topic = (original.raw_headers.get("Thread-Topic") or "").strip()
+        if thread_topic:
+            msg["Thread-Topic"] = thread_topic
+        thread_index = (original.raw_headers.get("Thread-Index") or "").strip()
+        if thread_index:
+            # Extend the parent's index rather than copy it verbatim.
+            msg["Thread-Index"] = thread_index + "AA=="
+
     # Loop protection on our own replies.
     msg["Auto-Submitted"] = "auto-replied"
     return msg

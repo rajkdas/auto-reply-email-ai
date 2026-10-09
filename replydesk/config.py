@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # generated reply looks suspicious (needs_human flag, unauthorized URLs or
     # money amounts). Set POST_CHECK_ENABLED=false in .env to disable it and
     # let approved replies go out over SMTP unconditionally.
-    post_check_enabled: bool = False
+    post_check_enabled: bool = True
 
     # --- LLM -----------------------------------------------------------
     llm_provider: str = "openai"
