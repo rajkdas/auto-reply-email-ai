@@ -49,9 +49,39 @@ python -m replydesk run
 |----------------|:------:|:--------------:|----------------------------------------------|
 | `dry_run`      |   no   |       no       | First days, demo, replay fixtures, Colab.    |
 | `draft_only`   |   no   |       yes       | Watch the IMAP Drafts folder for a few days.  |
-| `live`         |  yes   |       n/a       | Production.                                  |
+| `live`         |  yes   |   only downgraded sends (post-check) or reply-generation failures; otherwise replies go straight out over SMTP | Production. |
 
 Switch with `MODE=live` in `.env`. Thresholds come from `.env` so you can tune them without code changes.
+
+### Getting replies actually sent (live mode checklist)
+
+If `decision=send` but no email arrives, check these in order:
+
+1. **Post-check downgrade** — log line `post_check downgraded ... reason=needs_human` means the safety
+   review rewrote `send` → `draft`; the reply is then appended to Gmail's **Drafts** folder (any non-
+   dry-run mode). Disable with `POST_CHECK_ENABLED=false`, or fix the root cause: add your domain to
+   `ALLOWED_DOMAINS` and keep product facts (prices/URLs) in `products.yaml` FAQ text.
+2. **Escalation rules** — `sentiment_score <= -0.6 AND urgency == high` returns `escalate` *before* a
+   reply is even generated (nothing to draft/send). Calmer test mail triggers auto-reply instead.
+3. **Dedupe** — a message-id already recorded in SQLite is skipped (`skip dedupe ... already processed`).
+   Send genuinely new mail when testing.
+4. **SMTP config** — `MODE=live` requires `SMTP_HOST/PORT/USER/PASSWORD` + an app password; see
+   `SMTP_SECURITY` below.
+
+---
+
+## Gmail notes (tested against imap.gmail.com / smtp.gmail.com)
+
+- Use a Google **App Password** (2FA required), not your normal password, for `IMAP_PASSWORD`/`SMTP_PASSWORD`.
+- `SMTP_PORT=465` + `SMTP_SECURITY=ssl`, **or** `SMTP_PORT=587` + `SMTP_SECURITY=starttls`. The two must
+  match: `ssl` = implicit TLS from the first byte, `starttls` = upgrade of a plain connection. A mismatched
+  pair makes sends hang or fail.
+- Fetching is UID-based end-to-end (`UID SEARCH UNSEEN` / `UID FETCH (BODY.PEEK[])` / `UID STORE \Seen`):
+  sequence numbers shift when mail is deleted mid-run and would flag the wrong messages.
+- `MAX_EMAILS` keeps the **newest** N unseen messages (UIDs are monotonically increasing), so a capped run
+  on a backlog mailbox works on fresh mail, not years-old unread. Unprocessed mail stays UNSEEN.
+- aioimaplib 2.x returns `Response(result, lines)` — there is no `.status`/`.data` — and delivers FETCH
+  literals as whole `bytearray` entries; `mail_io.py` handles both shapes (see regression tests).
 
 ---
 
@@ -64,9 +94,17 @@ Two env vars control which LLM model is used:
 - `LLM_REPLY_MODEL`     — for the reply chain (use a stronger model if you want).
 - `LLM_REPLY_FALLBACK_MODEL` — optional, used as a fallback if the primary model fails after retries.
 
-`LLM_PROVIDER` switches provider without code changes: `openai | azure_openai | anthropic | google_genai | ollama`. Install only the `langchain-<provider>` package you need.
+`LLM_PROVIDER` switches provider without code changes: `openai | azure_openai | anthropic | google_genai | ollama`. Install only the `langchain-<provider>` package you need (e.g. `pip install langchain-google-genai google-genai` for Gemini/Gemma models).
 
 For offline / demo runs (no API keys), set `FAKE_LLM=true` to use a deterministic stub chain.
+
+### Post-check safety gate (`POST_CHECK_ENABLED`)
+
+After the reply is generated, an extra LLM review can downgrade `send` → `draft` (see Rules engine
+below). The gate is on by default. Set `POST_CHECK_ENABLED=false` in `.env` to disable it and let
+rule-approved replies go straight out over SMTP in live mode. Prefer fixing false positives instead of
+disabling in production: keep your domain in `ALLOWED_DOMAINS` and all facts the model may quote
+(prices, URLs, policies) inside `products.yaml` FAQ text.
 
 ---
 
@@ -110,6 +148,10 @@ After the reply is generated, a small **post-check** downgrades `SEND` → `DRAF
 - Contains a URL outside `ALLOWED_DOMAINS`.
 - Mentions a money amount not found in the catalog/FAQ context.
 - Has `needs_human=True`.
+
+This gate can be switched off entirely with `POST_CHECK_ENABLED=false` in `.env` (see above). When it
+downgrades a decision in `live` mode, the reply is appended to the IMAP **Drafts** folder — it is never
+silently discarded.
 
 ---
 
@@ -170,15 +212,29 @@ docker compose logs -f
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                  # 45 unit + pipeline tests, ~2s
+pytest                  # 53 unit + pipeline tests (incl. IMAP FETCH regression suite), ~2s
 ruff check .            # lint
 ```
 
-No real LLM or mailbox is needed for tests. The pipeline test uses a stub analysis/reply chain and a temp SQLite file.
+No real LLM or mailbox is needed for tests. The pipeline test uses a stub analysis/reply chain and a temp SQLite file. The `mail_io` tests reproduce aioimaplib 2.x's real response shapes (`Response(result, lines)`, whole-`bytearray` FETCH literals, Gmail `{size}` markers) so protocol regressions are caught offline.
 
 A live sanity check against a real model and real mailbox is opt-in: `pytest -m live`.
 
 CI (GitHub Actions): one workflow, matrix `ubuntu / windows` × Python `3.10 / 3.11 / 3.12`, running `ruff` and `pytest`.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `no body bytes in FETCH response uid=...` | Old `mail_io.py` (< commit `391d731`). Update — the extractor now anchors on the `{size}` literal marker and accepts `bytearray` entries. |
+| `skip dedupe ... (already processed)` but no reply ever went out | Earlier crashed run left the message-id in SQLite (`processing` → `review`). Delete `data/replydesk.db*` to reprocess, or send new mail. |
+| `decision=send` then `post_check downgraded ... reason=needs_human` | Safety gate rewrote send→draft; reply lands in Gmail **Drafts**. Tune `ALLOWED_DOMAINS`/FAQ, or set `POST_CHECK_ENABLED=false`. |
+| `decision=draft mode=Mode.live id=... (no side effect)` | Old `main.py` (< commit `5464cd1`) silently discarded downgraded replies. Update — drafts are now appended in any non-dry-run mode. |
+| Gemini/Gemma `503 UNAVAILABLE ... high demand` | Transient provider-side capacity error; the SDK retries automatically. If it persists, switch `LLM_*_MODEL` or provider. |
+| Both `GOOGLE_API_KEY` and `GEMINI_API_KEY` warnings | Harmless; the SDK prefers `GOOGLE_API_KEY`. Set only one to silence it. |
+| Sends hang / TLS errors in live mode | `SMTP_SECURITY` doesn't match `SMTP_PORT`: use `ssl`+465 or `starttls`+587. |
 
 ---
 
