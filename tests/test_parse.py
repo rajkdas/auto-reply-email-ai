@@ -117,7 +117,6 @@ def test_parse_uid_list_classic_search():
 
 
 def test_parse_uid_list_eshow_range():
-    lines = [b"* ESEARCH (TAG x) UIDLIST 5:7,20"]
     # comma form is not expanded; colon ranges are
     assert "6" in _parse_uid_list([b"* ESEARCH (UIDS 5:7 20)"])
 

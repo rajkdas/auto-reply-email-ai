@@ -435,9 +435,9 @@ def _join_fetch_lines(resp_lines: list) -> bytes | None:
 
     # --- Fallback 2: legacy imaplib-style (meta, body) tuples ---------------
     for item in resp_lines:
-        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], (bytes, bytearray)):
-            if len(item[1]) > 50:
-                return bytes(item[1])
+        if (isinstance(item, tuple) and len(item) == 2
+                and isinstance(item[1], (bytes, bytearray)) and len(item[1]) > 50):
+            return bytes(item[1])
 
     # --- Fallback 3: largest non-status blob (never silently skip) ---------
     candidates = [item for item in blobs
