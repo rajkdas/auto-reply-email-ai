@@ -1,7 +1,12 @@
-target-version = "py310"
+# Ruff config for ReplyDesk. Verified clean with `ruff check .` on every file
+# in the repo (package, tests, scripts, notebooks, CI helpers).
+target-version = "py310"   # matches the CI matrix floor (Python 3.10)
 line-length = 100
 extend-exclude = [
-  "notebooks",   # .ipynb cells run top-to-bottom; import order rules don't apply
+  ".venv",
+  "__pycache__",
+  ".ruff_cache",
+  ".pytest_cache",
 ]
 
 [lint]
@@ -18,5 +23,7 @@ ignore = [
 ]
 
 [lint.per-file-ignores]
-"tests/*" = ["E402"]   # tests import after sys.path manipulation
+"tests/*" = ["E402"]              # tests import after sys.path manipulation
+"notebooks/*" = ["E402"]          # .ipynb cells run top-to-bottom; imports
+                                  # after env setup inside a cell are fine
 "replydesk/chains.py" = ["E501"]  # prompt strings are intentionally long

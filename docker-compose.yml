@@ -7,12 +7,30 @@ services:
     env_file:
       - .env
     volumes:
-      # Persistent SQLite DB + logs.
+      # Persistent SQLite DB + logs. The image's default DB_PATH is
+      # /data/replydesk.db, so this bind mount keeps dedupe state across
+      # container restarts/rebuilds. (If your .env sets a relative DB_PATH
+      # like data/replydesk.db it resolves to /app/data/... instead - set
+      # DB_PATH=/data/replydesk.db in .env for containerized runs.)
       - ./data:/data
       # Your products.yaml (catalog + FAQ). Defaults to products.example.yaml
       # baked into the image; mount the real one to override.
       - ./products.yaml:/app/products.yaml:ro
-      # Optional .env override.
+      # Optional live-override of the config file inside the container
+      # (pydantic-settings reads /app/.env; `env_file:` above already injects
+      # the same values as environment variables, which take precedence).
       - ./.env:/app/.env:ro
-    # Only outbound ports needed (IMAP 993, SMTP 587/465, HTTPS).
-    network_mode: host
+    # ReplyDesk opens NO listening sockets - it only dials out to IMAP 993,
+    # SMTP 465/587 and the LLM API over HTTPS. The default bridge network
+    # handles that fine and is safer than host mode (no need to disable the
+    # netfilter modules on Docker Desktop just to get outbound connectivity).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import replydesk"]
+      interval: 60s
+      timeout: 5s
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
